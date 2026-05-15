@@ -87,6 +87,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<UnifiedComparisonResult | null>(null);
+  const [streamingText, setStreamingText] = useState("");
 
   async function handleLookup(e: React.FormEvent) {
     e.preventDefault();
@@ -96,6 +97,7 @@ export default function Home() {
     setLoading(true);
     setError(null);
     setResult(null);
+    setStreamingText("");
 
     try {
       const res = await fetch("/api/lookup", {
@@ -103,11 +105,33 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ word: target }),
       });
-      const data = await res.json();
+
       if (!res.ok) {
+        const data = await res.json();
         throw new Error(data.error || "查询失败");
       }
-      setResult(data as UnifiedComparisonResult);
+
+      // Read streaming response
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("浏览器不支持流式读取");
+
+      const decoder = new TextDecoder();
+      let fullText = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        fullText += decoder.decode(value, { stream: true });
+        setStreamingText(fullText);
+      }
+
+      // Flush remaining
+      fullText += decoder.decode();
+      setStreamingText(fullText);
+
+      const parsed = JSON.parse(fullText) as UnifiedComparisonResult;
+      setResult(parsed);
+      setStreamingText("");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -155,7 +179,7 @@ export default function Home() {
         )}
 
         {loading && (
-          <div className="text-zinc-500 text-sm">AI 正在分析近义词，请稍候…</div>
+          <StreamingPreview text={streamingText} />
         )}
 
         {result && <ComparisonTable result={result} />}
@@ -174,6 +198,82 @@ export default function Home() {
       </main>
     </div>
   );
+}
+
+function StreamingPreview({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+
+  // Try to extract partial info from the streaming JSON
+  const partialWords = extractPartialStringArray(text, "words");
+  const partialOverview = extractPartialString(text, "overview");
+
+  return (
+    <div className="p-5 rounded-xl bg-white dark:bg-zinc-900 border border-blue-200 dark:border-blue-800 mb-6">
+      <div className="flex items-center gap-3 mb-3">
+        <span className="relative flex h-3 w-3">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+          <span className="relative inline-flex rounded-full h-3 w-3 bg-blue-500" />
+        </span>
+        <span className="text-sm font-medium text-blue-700 dark:text-blue-300">
+          AI 正在生成分析...
+        </span>
+        {text && (
+          <span className="text-xs text-zinc-500 ml-auto">
+            {text.length} 字符
+          </span>
+        )}
+      </div>
+
+      {/* Partial results preview */}
+      {partialWords.length > 0 && (
+        <div className="mb-3 flex flex-wrap gap-1.5">
+          {partialWords.map((w) => (
+            <span
+              key={w}
+              className="text-xs px-2 py-0.5 rounded-full bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 border border-blue-100 dark:border-blue-900"
+            >
+              {w}
+            </span>
+          ))}
+          {partialWords.length === 0 && (
+            <span className="text-xs text-zinc-500">正在发现近义词...</span>
+          )}
+        </div>
+      )}
+
+      {partialOverview && (
+        <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-3 leading-relaxed">
+          {partialOverview}
+        </p>
+      )}
+
+      {/* Expandable raw stream */}
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="text-xs text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 underline"
+      >
+        {expanded ? "收起原始输出" : "查看原始输出"}
+      </button>
+      {expanded && text && (
+        <pre className="mt-2 p-3 rounded-lg bg-zinc-50 dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 text-xs text-zinc-600 dark:text-zinc-400 overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap">
+          {text}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function extractPartialStringArray(text: string, key: string): string[] {
+  const match = text.match(new RegExp(`"${key}"\\s*:\\s*\\[([^\\]]*)\\]`));
+  if (!match) return [];
+  const inner = match[1];
+  const items = inner.match(/"([^"]+)"/g);
+  return items ? items.map((s) => s.replace(/"/g, "")) : [];
+}
+
+function extractPartialString(text: string, key: string): string {
+  const match = text.match(new RegExp(`"${key}"\\s*:\\s*"([^"]*)"`));
+  return match ? match[1] : "";
 }
 
 function ComparisonTable({ result }: { result: UnifiedComparisonResult }) {

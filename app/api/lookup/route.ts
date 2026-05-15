@@ -6,14 +6,14 @@ export const maxDuration = 60;
 const SYSTEM_PROMPT = `你是一位资深雅思写作高分导师，精通雅思（IELTS）官方评分标准，特别擅长帮目标分数 8.0 及以上的考生精准区分和使用近义词。
 
 用户会给你 1-3 个英文词。你要做的是：
-1. 以用户输入的词为起点，主动发现并补充 3-5 个最值得对比的近义词
+1. 以用户输入的词为起点，主动发现并补充最值得对比的近义词（**总共不超过 8 个词**，含用户输入的）
 2. 对所有词（用户输入的 + 你补充的）做统一维度的对比
 3. 在 JSON 中标记哪些是用户输入的词（userInput），哪些是你补充的
 
 你必须严格返回合法 JSON，结构如下：
 
 {
-  "words": ["所有被对比的词，全部小写，用户输入的排前面"],
+  "words": ["所有被对比的词，全部小写，用户输入的排前面，最多8个"],
   "userInput": ["用户实际输入的词，全部小写"],
   "overview": "用中文一句话概括这组近义词的关系和最核心的区别",
   "quickestRule": "用中文给一个最短选择规则，帮考生在考场上快速决策",
@@ -52,9 +52,9 @@ const SYSTEM_PROMPT = `你是一位资深雅思写作高分导师，精通雅思
 }
 
 要求：
+- **总共最多 8 个词，不要超过**
 - synonyms 数组**必须覆盖所有词**（用户输入的 + 你补充的），顺序与 words 数组一致
 - 用户输入的词在 synonyms 中同样需要完整的对比数据
-- 补充 3-5 个近义词即可，挑最值得对比的
 - distinctions 给 3-5 个最能帮助考生做选择的维度
 - collocations 必须是英文短语数组，不要加中文解释
 - 所有中文说明要简洁、具体、可执行，避免空话套话
@@ -74,7 +74,7 @@ function isValidEnglishTerm(term: string) {
   return /^[a-z][a-z'-]*$/.test(term);
 }
 
-async function requestDeepSeek({
+function createDeepSeekStream({
   apiKey,
   systemPrompt,
   userPrompt,
@@ -82,36 +82,76 @@ async function requestDeepSeek({
   apiKey: string;
   systemPrompt: string;
   userPrompt: string;
-}) {
-  const res = await fetch("https://api.deepseek.com/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
+}): ReadableStream {
+  return new ReadableStream({
+    async start(controller) {
+      let res: Response;
+      try {
+        res = await fetch("https://api.deepseek.com/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: "deepseek-chat",
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: userPrompt },
+            ],
+            response_format: { type: "json_object" },
+            stream: true,
+            temperature: 0.3,
+          }),
+        });
+      } catch (err) {
+        controller.error(err);
+        return;
+      }
+
+      if (!res.ok) {
+        const text = await res.text();
+        controller.error(new Error(`DeepSeek API 错误：${res.status} ${text}`));
+        return;
+      }
+
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const data = line.slice(6).trim();
+            if (data === "[DONE]") {
+              controller.close();
+              return;
+            }
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed?.choices?.[0]?.delta?.content;
+              if (content) {
+                controller.enqueue(new TextEncoder().encode(content));
+              }
+            } catch {
+              // skip unparseable SSE lines
+            }
+          }
+        }
+        controller.close();
+      } catch (err) {
+        controller.error(err);
+      }
     },
-    body: JSON.stringify({
-      model: "deepseek-chat",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.3,
-    }),
   });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`DeepSeek API 错误：${res.status} ${text}`);
-  }
-
-  const data = await res.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error("DeepSeek 未返回有效内容");
-  }
-
-  return JSON.parse(content);
 }
 
 export async function POST(req: Request) {
@@ -160,21 +200,18 @@ export async function POST(req: Request) {
         ? `请分析单词 "${terms[0]}"，并主动找出它的主要近义词一起做深度对比。`
         : `请对比这些词：${terms.join(", ")}，并主动补充更多相关近义词一起做深度对比。`;
 
-    const parsed = await requestDeepSeek({
+    const stream = createDeepSeekStream({
       apiKey,
       systemPrompt: SYSTEM_PROMPT,
       userPrompt,
     });
 
-    return NextResponse.json({
-      words: parsed.words ?? terms,
-      userInput: parsed.userInput ?? terms,
-      overview: parsed.overview ?? "",
-      quickestRule: parsed.quickestRule ?? "",
-      recommended: parsed.recommended ?? null,
-      synonyms: parsed.synonyms ?? [],
-      distinctions: parsed.distinctions ?? [],
-      ieltsAdvice: parsed.ieltsAdvice ?? null,
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+      },
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
